@@ -12,9 +12,17 @@
  *******************************************************************************/
 package com.tremolosecurity.proxy.auth.util;
 
+import java.io.IOException;
+import java.io.UnsupportedEncodingException;
 import java.net.MalformedURLException;
+import java.net.URL;
+import java.security.InvalidKeyException;
+import java.security.NoSuchAlgorithmException;
 import java.util.HashMap;
 
+import javax.crypto.BadPaddingException;
+import javax.crypto.IllegalBlockSizeException;
+import javax.crypto.NoSuchPaddingException;
 import javax.servlet.ServletException;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpSession;
@@ -27,7 +35,10 @@ import org.jose4j.lang.JoseException;
 
 import com.novell.ldap.LDAPException;
 import com.tremolosecurity.config.util.UrlHolder;
+import com.tremolosecurity.config.xml.ApplicationType;
+import com.tremolosecurity.idp.providers.OpenIDConnectAccessToken;
 import com.tremolosecurity.idp.providers.OpenIDConnectIdP;
+import com.tremolosecurity.idp.providers.oidc.model.OIDCSession;
 import com.tremolosecurity.provisioning.core.ProvisioningException;
 import com.tremolosecurity.proxy.auth.AuthController;
 import com.tremolosecurity.proxy.auth.RequestHolder;
@@ -36,73 +47,80 @@ import com.tremolosecurity.saml.Attribute;
 import com.tremolosecurity.server.GlobalEntries;
 
 public class OpenIDConnectToken {
-	JwtClaims claims;
-	JsonWebSignature jws;
-	String encodedJSON;
+	JwtClaims idClaims;
+	JsonWebSignature idJws;
+	String idEncodedJSON;
+
+	JwtClaims accessClaims;
+	JsonWebSignature accessJws;
+	String accessEncodedJSON;
+
 	DateTime expires;
 	String trustName;
 	String idpName;
-	
-	public OpenIDConnectToken(String idpName,String trustName) {
+	String urlOfRequest;
+	private OIDCSession oidcSession;
+	private ApplicationType app;
+
+	public OpenIDConnectToken(String idpName, String trustName, String urlOfRequest) {
 		this.idpName = idpName;
 		this.trustName = trustName;
+		this.urlOfRequest = urlOfRequest;
 	}
-	
-	public void generateToken(HttpServletRequest request) throws ServletException, MalformedURLException, JoseException, LDAPException, ProvisioningException, MalformedClaimException {
-		HttpSession session = ((HttpServletRequest) request).getSession(); 
-		UrlHolder holder = (UrlHolder) request.getAttribute(ProxyConstants.AUTOIDM_CFG);
-		if (holder == null) {
-			throw new ServletException("Holder is null");
-		}
-		
-		RequestHolder reqHolder = ((AuthController) session.getAttribute(ProxyConstants.AUTH_CTL)).getHolder();
-		
-		HashMap<String,Attribute> authParams = (HashMap<String,Attribute>) session.getAttribute(ProxyConstants.AUTH_MECH_PARAMS);
-		
-		AuthController ac = ((AuthController) request.getSession().getAttribute(ProxyConstants.AUTH_CTL));
-		
-		HashMap<String,OpenIDConnectIdP> idps = (HashMap<String, OpenIDConnectIdP>) GlobalEntries.getGlobalEntries().get(OpenIDConnectIdP.UNISON_OPENIDCONNECT_IDPS);
-		
+
+	public void generateToken(HttpSession session) throws ServletException, MalformedURLException, JoseException,
+			LDAPException, ProvisioningException, MalformedClaimException {
+
+		AuthController ac = ((AuthController) session.getAttribute(ProxyConstants.AUTH_CTL));
+
+		HashMap<String, OpenIDConnectIdP> idps = (HashMap<String, OpenIDConnectIdP>) GlobalEntries.getGlobalEntries()
+				.get(OpenIDConnectIdP.UNISON_OPENIDCONNECT_IDPS);
+
 		OpenIDConnectIdP idp = idps.get(this.idpName);
 		if (idp == null) {
 			throw new ServletException("Could not find idp '" + this.idpName + "'");
 		}
+
+		this.idClaims = idp.generateClaims(ac.getAuthInfo(), GlobalEntries.getGlobalEntries().getConfigManager(),
+				trustName, this.urlOfRequest);
+		this.idJws = idp.generateJWS(getClaims());
+		this.idEncodedJSON = this.idJws.getCompactSerialization();
+
+		this.accessClaims = idp.generateClaims(ac.getAuthInfo(), GlobalEntries.getGlobalEntries().getConfigManager(),
+				trustName, this.urlOfRequest);
+		this.accessJws = idp.generateJWS(getClaims());
+		this.accessEncodedJSON = this.idJws.getCompactSerialization();
+
+		this.expires = new DateTime(idClaims.getExpirationTime().getValueInMillis());
 		
+		if (this.oidcSession != null) {
+			this.oidcSession.setAccessToken(this.accessEncodedJSON);
+			this.oidcSession.setIdToken(this.idEncodedJSON);
+			idp.updateToken(oidcSession);
+		}
 		
-		this.claims = idp.generateClaims(ac.getAuthInfo(), holder.getConfig(), trustName, request); 
-		this.jws = idp.generateJWS(getClaims());
-		this.encodedJSON = this.jws.getCompactSerialization();
-		
-		
-		
-		
-		this.expires = new DateTime(claims.getExpirationTime().getValueInMillis());
 	}
-	
-	
-	
+
 	public JwtClaims getClaims() {
-		return claims;
+		return idClaims;
 	}
-	
-	
+
 	public JsonWebSignature getJws() {
-		return jws;
+		return idJws;
 	}
-	
-	public String getEncodedJSON() {
-		return encodedJSON;
+
+	public String getEncodedIdJSON() {
+		return idEncodedJSON;
 	}
-	
-	
+
 	public DateTime getExpires() {
 		return expires;
 	}
+
 	public String getTrustName() {
 		return trustName;
 	}
-	
-	
+
 	public boolean isExpired() {
 		return this.expires.isBeforeNow();
 	}
@@ -110,6 +128,32 @@ public class OpenIDConnectToken {
 	public String getIdpName() {
 		return idpName;
 	}
-	
-	
+
+	public void createToken(HttpServletRequest request) throws InvalidKeyException, NoSuchAlgorithmException,
+			NoSuchPaddingException, IllegalBlockSizeException, BadPaddingException, MalformedClaimException,
+			ServletException, JoseException, LDAPException, ProvisioningException, IOException {
+		this.generateToken(request.getSession());
+		OpenIDConnectAccessToken access = new OpenIDConnectAccessToken();
+
+		access.setAccess_token(this.accessEncodedJSON);
+		access.setId_token(this.idEncodedJSON);
+
+		UrlHolder holder = (UrlHolder) request.getAttribute(ProxyConstants.AUTOIDM_CFG);
+		this.app = holder.getApp();
+
+		HashMap<String, OpenIDConnectIdP> idps = (HashMap<String, OpenIDConnectIdP>) GlobalEntries.getGlobalEntries()
+				.get(OpenIDConnectIdP.UNISON_OPENIDCONNECT_IDPS);
+
+		this.oidcSession = idps.get(this.idpName).storeSession(access, holder.getApp(),
+				idps.get(idpName).getTrusts().get(this.trustName).getCodeLastmileKeyName(), request);
+
+	}
+
+	public String getAccessEncodedJSON() {
+		return accessEncodedJSON;
+	}
+
+	public String getRefreshToken() {
+		return this.oidcSession.getEncryptedRefreshToken();
+	}
 }
